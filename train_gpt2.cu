@@ -82,6 +82,72 @@ cudaStream_t main_stream;
 constexpr const size_t IO_BUF_SIZE = 32 * 1024 * 1024;
 
 // ----------------------------------------------------------------------------
+// FP16 Loss Scaling for numerical stability
+// FP16 has limited dynamic range, so we scale the loss before backward pass
+// and unscale the gradients afterwards to prevent underflow
+
+#if defined(ENABLE_FP16)
+static float fp16_loss_scale = 1024.0f;  // Initial scale factor
+static const float fp16_scale_growth_factor = 2.0f;
+static const float fp16_scale_backoff_factor = 0.5f;
+static const float fp16_min_scale = 1.0f;
+static const float fp16_max_scale = 65536.0f;
+static int fp16_scale_growth_interval = 2000;  // Increase scale every N steps without overflow
+static int fp16_steps_since_last_overflow = 0;
+
+// Kernel to check for NaN/Inf in gradients and scale them
+__global__ void check_and_unscale_gradients_kernel(floatX* grads, float* found_inf, float inv_scale, size_t n) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float val = (float)grads[idx];
+        if (!isfinite(val)) {
+            *found_inf = 1.0f;
+        } else {
+            grads[idx] = (floatX)(val * inv_scale);
+        }
+    }
+}
+
+// Check for NaN/Inf in gradients and unscale them
+// Returns true if overflow was found
+bool fp16_check_and_unscale_gradients(floatX* grads, size_t num_params, cudaStream_t stream) {
+    float* d_found_inf;
+    float h_found_inf = 0.0f;
+    cudaCheck(cudaMalloc(&d_found_inf, sizeof(float)));
+    cudaCheck(cudaMemset(d_found_inf, 0, sizeof(float)));
+    
+    float inv_scale = 1.0f / fp16_loss_scale;
+    int block_size = 256;
+    int grid_size = (num_params + block_size - 1) / block_size;
+    check_and_unscale_gradients_kernel<<<grid_size, block_size, 0, stream>>>(grads, d_found_inf, inv_scale, num_params);
+    
+    cudaCheck(cudaMemcpy(&h_found_inf, d_found_inf, sizeof(float), cudaMemcpyDeviceToHost));
+    cudaCheck(cudaFree(d_found_inf));
+    
+    bool overflow = (h_found_inf > 0.0f);
+    
+    if (overflow) {
+        // Reduce scale on overflow
+        fp16_loss_scale = fmaxf(fp16_loss_scale * fp16_scale_backoff_factor, fp16_min_scale);
+        fp16_steps_since_last_overflow = 0;
+    } else {
+        // Increase scale if no overflow for a while
+        fp16_steps_since_last_overflow++;
+        if (fp16_steps_since_last_overflow >= fp16_scale_growth_interval) {
+            fp16_loss_scale = fminf(fp16_loss_scale * fp16_scale_growth_factor, fp16_max_scale);
+            fp16_steps_since_last_overflow = 0;
+        }
+    }
+    
+    return overflow;
+}
+
+float get_fp16_loss_scale() { return fp16_loss_scale; }
+#else
+float get_fp16_loss_scale() { return 1.0f; }
+#endif
+
+// ----------------------------------------------------------------------------
 // GPT-2 model definition
 
 typedef struct {
@@ -451,19 +517,19 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     fcloseCheck(model_file);
 }
 
+// Kernel to convert FP32 to FP16
+__global__ void convert_fp32_to_fp16_kernel(half* out, const float* in, size_t n) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        out[idx] = __float2half(in[idx]);
+    }
+}
+
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool weight_init=true) {
     // If weight_init is true, we will load the weights from this checkpoint .bin file
     // We sometimes want this to be false, if we are going to initialize these weights from
     // the master weights that are instead stored in the state .bin file.
     // In that case, this function mostly loads the model hyperparameters from the header.
-
-    if (PRECISION_MODE == PRECISION_FP16) {
-        // TODO for later perhaps, would require us dynamically converting the
-        // model weights from fp32 to fp16 online, here in this function, or writing
-        // the fp16 weights directly from Python, which we only do for fp32/bf16 atm.
-        fprintf(stderr, "build_from_checkpoint() does not support fp16 right now.\n");
-        exit(EXIT_FAILURE);
-    }
 
     // read in model from a checkpoint file
     FILE *model_file = fopenCheck(checkpoint_path, "rb");
@@ -479,7 +545,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
         exit(EXIT_FAILURE);
     }
 
-    // check if the precision mode of the checkpoing matches the model precision
+    // check if the precision mode of the checkpoint matches the model precision
     if (weight_init) {
         if (PRECISION_MODE == PRECISION_BF16 && version != 5) {
             fprintf(stderr, "Precision is configured as BF16 but model at %s is not.\n", checkpoint_path);
@@ -490,6 +556,12 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
             fprintf(stderr, "Precision is configured as FP32 but model at %s is not.\n", checkpoint_path);
             fprintf(stderr, "---> HINT: to turn on FP32 you have to compile like: `make train_gpt2cu PRECISION=FP32`\n");
             fprintf(stderr, "---> HINT: are you sure you're loading a .bin file without any _bf16 in the name?\n");
+            exit(EXIT_FAILURE);
+        }
+        // FP16: we can load from FP32 checkpoint and convert
+        if (PRECISION_MODE == PRECISION_FP16 && version != 3) {
+            fprintf(stderr, "Precision is configured as FP16. For FP16, we load FP32 weights and convert.\n");
+            fprintf(stderr, "---> HINT: use gpt2_124M.bin (FP32) instead of _bf16.bin\n");
             exit(EXIT_FAILURE);
         }
     }
@@ -508,7 +580,34 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
     // read in the parameters if weight_init is true
     if (weight_init) {
         assert(model->params_memory != NULL);
-        file_to_device(model->params_memory, model_file, model->num_parameters_bytes, IO_BUF_SIZE, main_stream);
+        
+        if (PRECISION_MODE == PRECISION_FP16) {
+            // FP16 mode: Load FP32 weights from file, convert to FP16 on GPU
+            // First, allocate temporary FP32 buffer on GPU
+            float* fp32_buffer;
+            size_t fp32_bytes = model->num_parameters * sizeof(float);
+            cudaCheck(cudaMalloc(&fp32_buffer, fp32_bytes));
+            
+            // Load FP32 weights to GPU buffer
+            file_to_device(fp32_buffer, model_file, fp32_bytes, IO_BUF_SIZE, main_stream);
+            cudaCheck(cudaDeviceSynchronize());
+            
+            // Convert FP32 to FP16 on GPU
+            int block_size = 256;
+            int grid_size = (model->num_parameters + block_size - 1) / block_size;
+            convert_fp32_to_fp16_kernel<<<grid_size, block_size, 0, main_stream>>>(
+                (half*)model->params_memory, fp32_buffer, model->num_parameters);
+            cudaCheck(cudaGetLastError());
+            cudaCheck(cudaDeviceSynchronize());
+            
+            // Free temporary buffer
+            cudaCheck(cudaFree(fp32_buffer));
+            
+            printf("FP16: Loaded FP32 weights and converted to FP16 (%zu parameters)\n", model->num_parameters);
+        } else {
+            // Normal loading for FP32 and BF16
+            file_to_device(model->params_memory, model_file, model->num_parameters_bytes, IO_BUF_SIZE, main_stream);
+        }
     }
     fcloseCheck(model_file);
 
@@ -816,7 +915,9 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
 
     // accumulate the losses inside acts.losses, and kick off the backward pass inside the fused classifier
     NvtxRange classifier_and_loss_range("classifier_and_loss");
-    const float dloss = 1.0f / (float)(B * T * grad_accum_steps); // results in the uniform average loss over all elements
+    // For FP16: multiply dloss by loss scale to prevent gradient underflow
+    float base_dloss = 1.0f / (float)(B * T * grad_accum_steps); // results in the uniform average loss over all elements
+    const float dloss = base_dloss * get_fp16_loss_scale();  // Apply FP16 loss scaling
     cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
     tokenCheck(targets, B*T, V);
     fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, True, main_stream);
@@ -1639,6 +1740,20 @@ int main(int argc, char *argv[]) {
     printf0("| num_processes         | %-50d |\n", multi_gpu_config.num_processes);
     printf0("| zero_stage            | %-50d |\n", multi_gpu_config.zero_stage);
     printf0("+-----------------------+----------------------------------------------------+\n");
+    
+    // Print precision mode information
+    #if defined(ENABLE_FP16)
+    printf0("+-----------------------+----------------------------------------------------+\n");
+    printf0("| FP16 Mixed Precision  | ENABLED (with dynamic loss scaling)               |\n");
+    printf0("| initial_loss_scale    | %-50.1f |\n", get_fp16_loss_scale());
+    printf0("+-----------------------+----------------------------------------------------+\n");
+    #elif defined(ENABLE_FP32)
+    printf0("| Precision Mode        | FP32 (Full Precision)                             |\n");
+    printf0("+-----------------------+----------------------------------------------------+\n");
+    #else
+    printf0("| Precision Mode        | BF16 (Default)                                    |\n");
+    printf0("+-----------------------+----------------------------------------------------+\n");
+    #endif
 
     // prints outside of pretty table to here and below
     if (!hellaswag_available) {
@@ -1834,6 +1949,17 @@ int main(int argc, char *argv[]) {
             // backward pass. all model params accumulate gradients with += inside this inner loop
             gpt2_backward_and_reduce(&model, train_loader.inputs, train_loader.targets, grad_accum_steps, micro_step);
         }
+        
+        // FP16: Check for overflow and unscale gradients
+        bool skip_update_overflow = false;
+        #if defined(ENABLE_FP16)
+        skip_update_overflow = fp16_check_and_unscale_gradients(
+            (floatX*)model.grads_memory, model.num_parameters, main_stream);
+        if (skip_update_overflow) {
+            printf0("FP16: gradient overflow detected, skipping update (scale=%.1f)\n", get_fp16_loss_scale());
+        }
+        #endif
+        
         float zloss = (float)(update_detector(&loss_outlier_detector, (double)model.mean_loss)); // loss z-score
         // fetch the next learning rate
         float step_learning_rate = get_learning_rate(&lr_scheduler, step);
@@ -1841,7 +1967,9 @@ int main(int argc, char *argv[]) {
         float grad_norm = gpt2_calculate_grad_norm(&model, &multi_gpu_config);
         float zgrad = (float)(update_detector(&grad_norm_outlier_detector, (double)grad_norm)); // grad z-score
         // update the model parameters
-        if (isfinite(zloss) && skip_update_lossz != 0.0f && zloss > skip_update_lossz) {
+        if (skip_update_overflow) {
+            // FP16: skip update due to gradient overflow, scale has been reduced
+        } else if (isfinite(zloss) && skip_update_lossz != 0.0f && zloss > skip_update_lossz) {
             printf0("skipping update due to loss z-score of %f\n", zloss);
         } else if (isfinite(zgrad) && skip_update_gradz != 0.0f && zgrad > skip_update_gradz) {
             printf0("skipping update due to grad z-score of %f\n", zgrad);
