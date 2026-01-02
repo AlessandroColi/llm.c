@@ -17,6 +17,7 @@ cuBLAS related utils
 #define CUBLAS_LOWP CUDA_R_32F
 #elif defined(ENABLE_FP16)
 #define CUBLAS_LOWP CUDA_R_16F
+#define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_16F 
 #else // default to bfloat16
 #define CUBLAS_LOWP CUDA_R_16BF
 #endif

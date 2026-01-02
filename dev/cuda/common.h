@@ -187,8 +187,20 @@ typedef __nv_bfloat16 floatX;
 typedef __nv_bfloat16 floatN;
 #define CUBLAS_LOWP CUDA_R_16BF // CUDA_R_16F or CUDA_R_16BF (or CUDA_R_32F)
 // CUBLAS_COMPUTE_32F or CUBLAS_COMPUTE_16F (for CUDA_R_16F only, potentially slower?!)
-#define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
-
+#if defined(ENABLE_FP16)
+    typedef half floatX;
+    typedef half floatN;
+    #define CUBLAS_LOWP CUDA_R_16F
+    #define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_16F
+#elif defined(ENABLE_BF16)
+    typedef __nv_bfloat16 floatX;
+    typedef __nv_bfloat16 floatN;
+    #define CUBLAS_LOWP CUDA_R_16BF
+    #define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
+#else
+    typedef float floatX;
+    typedef float floatN;
+#endif
 #elif defined(ENABLE_FP16)
 
 typedef half floatX;

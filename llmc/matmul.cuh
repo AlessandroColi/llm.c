@@ -229,16 +229,132 @@ void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* 
 
 // small wrapper around matmul_cublaslt for the forward pass (keeping historical order of arguments)
 void matmul_forward_cublaslt(floatX* out,
-                     floatX* inp, floatX* weight, floatX* bias,
-                     int B, int T, int C, int OC, cudaStream_t stream,
-                     floatX* pre_gelu=NULL, int gelu_fusion=1) {
-    // By default only fuse GELU for H100+ as cuBLAS seems to be inefficient for fused GELU on Ada/Ampere (?)
-    if (gelu_fusion < 1 && pre_gelu) {
-        matmul_cublaslt(pre_gelu, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, NULL, false);
-        gelu_forward(out, pre_gelu, B*T*OC, stream);
-    } else {
-        matmul_cublaslt(out, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, pre_gelu, false);
+                             const floatX* inp, const floatX* weight, const floatX* bias,
+                             int B, int T, int C, int OC,
+                             cudaStream_t stream,
+                             floatX* pre_gelu=nullptr, floatX* pre_gelu_out=nullptr,
+                             int gelu_fusion=0) {
+    
+    int has_bias = (bias != NULL);
+    int has_gelu = (pre_gelu != NULL) ? gelu_fusion : 0;
+
+    // Check bias alignment
+    if(has_bias && ((uintptr_t)bias % 16) != 0) {
+        printf("Bias pointer is not aligned (cuBLASLt requirement)!\n");
+        exit(EXIT_FAILURE);
     }
+
+    // ========================================================================
+    // CRITICAL FP16 FIX: Scale factors MUST match compute type
+    // ========================================================================
+    #if defined(ENABLE_FP16)
+        // FP16 compute REQUIRES half precision scale factors
+        // Using float scale factors will cause numerical corruption and gibberish!
+        half alpha_fp16 = __float2half(1.0f);
+        half beta_fp16 = __float2half(0.0f);
+        void* alpha_ptr = (void*)&alpha_fp16;
+        void* beta_ptr = (void*)&beta_fp16;
+        cublasComputeType_t computeType = CUBLAS_COMPUTE_16F;
+        cudaDataType_t scaleType = CUDA_R_16F;  // Must match scale factor type
+        cudaDataType_t dataType = CUDA_R_16F;
+    #elif defined(ENABLE_BF16)
+        // BF16 typically uses FP32 accumulation
+        float alpha = 1.0f;
+        float beta = 0.0f;
+        void* alpha_ptr = (void*)&alpha;
+        void* beta_ptr = (void*)&beta;
+        cublasComputeType_t computeType = CUBLAS_COMPUTE_32F_FAST_TF32;
+        cudaDataType_t scaleType = CUDA_R_32F;
+        cudaDataType_t dataType = CUDA_R_16BF;
+    #else
+        // FP32
+        float alpha = 1.0f;
+        float beta = 0.0f;
+        void* alpha_ptr = (void*)&alpha;
+        void* beta_ptr = (void*)&beta;
+        cublasComputeType_t computeType = CUBLAS_COMPUTE_32F_FAST_TF32;
+        cudaDataType_t scaleType = CUDA_R_32F;
+        cudaDataType_t dataType = CUDA_R_32F;
+    #endif
+
+    int returnedResults = 0;
+    cublasLtMatmulDesc_t operationDesc;
+    cublasLtMatmulPreference_t preference;
+    cublasLtMatrixLayout_t weightLayout;
+    cublasLtMatrixLayout_t inputLayout;
+    cublasLtMatrixLayout_t outputLayout;
+    cublasLtMatrixLayout_t biasLayout;
+    cublasLtMatmulHeuristicResult_t heuristic;
+
+    // Create operation descriptor with correct compute and scale types
+    cublasCheck(cublasLtMatmulDescCreate(&operationDesc, computeType, scaleType));
+    
+    cublasOperation_t opNoTranspose = CUBLAS_OP_N;
+    cublasOperation_t opTranspose = CUBLAS_OP_T;
+    
+    // Set epilogue for bias/gelu fusion
+    cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_DEFAULT;
+    if (has_bias && has_gelu) {
+        epilogue = CUBLASLT_EPILOGUE_GELU_BIAS;
+    } else if (has_bias) {
+        epilogue = CUBLASLT_EPILOGUE_BIAS;
+    } else if (has_gelu) {
+        epilogue = CUBLASLT_EPILOGUE_GELU;
+    }
+    
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, 
+                                               &opTranspose, sizeof(opTranspose)));
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, 
+                                               &opNoTranspose, sizeof(opNoTranspose)));
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, 
+                                               &epilogue, sizeof(epilogue)));
+    
+    if(has_bias) {
+        cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, 
+                                                   &bias, sizeof(bias)));
+    }
+
+    // Define matrix layouts with correct data type
+    cublasCheck(cublasLtMatrixLayoutCreate(&weightLayout, dataType, C, OC, C));
+    cublasCheck(cublasLtMatrixLayoutCreate(&inputLayout, dataType, C, B*T, C));
+    cublasCheck(cublasLtMatrixLayoutCreate(&outputLayout, dataType, OC, B*T, OC));
+    cublasCheck(cublasLtMatrixLayoutCreate(&biasLayout, dataType, OC, 1, OC));
+
+    // Create preference
+    cublasCheck(cublasLtMatmulPreferenceCreate(&preference));
+    cublasCheck(cublasLtMatmulPreferenceSetAttribute(preference,
+        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        &cublaslt_workspace_size, sizeof(cublaslt_workspace_size)));
+
+    // Find algorithm
+    cublasCheck(cublasLtMatmulAlgoGetHeuristic(cublaslt_handle, operationDesc,
+        weightLayout, inputLayout, outputLayout, outputLayout,
+        preference, 1, &heuristic, &returnedResults));
+        
+    if (returnedResults == 0) {
+        printf("No cuBLASLt algorithm: B=%d, T=%d, C=%d, OC=%d\n", B, T, C, OC);
+        exit(EXIT_FAILURE);
+    }
+
+    // ========================================================================
+    // Perform matmul with correct scale factor pointers
+    // ========================================================================
+    cublasCheck(cublasLtMatmul(cublaslt_handle, operationDesc,
+        alpha_ptr, weight, weightLayout,      // Use alpha_ptr, not &alpha
+        inp, inputLayout, 
+        beta_ptr,                              // Use beta_ptr, not &beta
+        out, outputLayout, 
+        out, outputLayout, 
+        &heuristic.algo,
+        cublaslt_workspace, cublaslt_workspace_size, stream));
+
+    // Cleanup
+    cublasCheck(cublasLtMatmulPreferenceDestroy(preference));
+    cublasCheck(cublasLtMatmulDescDestroy(operationDesc));
+    cublasCheck(cublasLtMatrixLayoutDestroy(weightLayout));
+    cublasCheck(cublasLtMatrixLayoutDestroy(inputLayout));
+    cublasCheck(cublasLtMatrixLayoutDestroy(outputLayout));
+    cublasCheck(cublasLtMatrixLayoutDestroy(biasLayout));
 }
 
 void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
